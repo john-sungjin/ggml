@@ -36,6 +36,8 @@ struct ws_hparams {
     int32_t vocab_size;
     int32_t d_head;
     int32_t ftype;
+
+    int32_t max_tokens = 512; // n_ctx in other files but ctx is super overloaded
 };
 
 struct ws_attention {
@@ -60,9 +62,6 @@ struct ws_model {
     std::vector<ws_block> blocks;
     struct ggml_tensor* layer_norm_final;
     struct ggml_tensor* embeddings_to_logits; // this is the same as tokens_to_embeddings; remove eventually
-
-    struct ggml_tensor* memory_k;
-    struct ggml_tensor* memory_v;
 
     struct ggml_context* ctx;
     std::map<std::string, struct ggml_tensor*> tensors;
@@ -156,9 +155,6 @@ bool ws_model_load(const std::string& fname, ws_model& model, gpt_vocab& vocab)
         ctx_size += d_model * ftype_size + ggml_tensor_overhead(); // layer_norm_final
         ctx_size += vocab_size * d_model * ftype_size + ggml_tensor_overhead(); // embeddings_to_logits
 
-        ctx_size += n_layers * d_model * ftype_size; // memory_k
-        ctx_size += n_layers * d_model * ftype_size; // memory_v
-
         printf("%s: ggml ctx size = %6.2f MB\n", __func__, ctx_size / (1024.0 * 1024.0));
     }
 
@@ -208,16 +204,6 @@ bool ws_model_load(const std::string& fname, ws_model& model, gpt_vocab& vocab)
 
         model.embeddings_to_logits = model.tokens_to_embeddings;
         model.tensors["embeddings_to_logits.weight"] = model.embeddings_to_logits;
-    }
-
-    // key + value memory
-    {
-        const int64_t n_memory_entries = n_layers;
-        const int64_t n_elements_per_entry = d_model;
-        const int64_t n_elements = n_memory_entries * n_elements_per_entry;
-
-        model.memory_k = ggml_new_tensor_1d(model.ctx, wtype, n_elements);
-        model.memory_v = ggml_new_tensor_1d(model.ctx, wtype, n_elements);
     }
 
     // load weights
@@ -297,10 +283,52 @@ bool ws_model_load(const std::string& fname, ws_model& model, gpt_vocab& vocab)
     return true;
 }
 
+// key-value cache for faster generation
+// tbh this is definitely overengineering for how small
+// this model is, but it's fun to implement
+struct ws_kv_cache {
+    struct ggml_tensor* k;
+    struct ggml_tensor* v;
+
+    struct ggml_context* ctx;
+
+    ws_kv_cache(const ws_hparams& hparams)
+    {
+        size_t n_layers = hparams.n_layers;
+        size_t d_model = hparams.d_model;
+
+        ggml_init_params params;
+
+        size_t buffer_mem = 0;
+
+        // memory size explanation:
+        // each token (hparams.max_tokens) produces a key and value vector of size d_model
+        // there are n_layers layers, so we need to store n_layers * d_model per token
+
+        buffer_mem += hparams.max_tokens * n_layers * d_model * sizeof(float); // k memory
+        buffer_mem += hparams.max_tokens * n_layers * d_model * sizeof(float); // v memory
+
+        params.mem_size = buffer_mem;
+        params.mem_buffer = NULL;
+        params.no_alloc = false;
+        ctx = ggml_init(params);
+
+        k = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_layers * d_model);
+        v = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_layers * d_model);
+    }
+
+    ~ws_kv_cache()
+    {
+        ggml_free(ctx);
+    }
+};
+
 // context for generation
 struct ws_context {
     const ws_model& model;
     const gpt_vocab& vocab;
+
+    struct ws_kv_cache kv_cache;
 
     // size_t mem_per_token = 0;
     // std::vector<float> logits;
@@ -309,6 +337,7 @@ struct ws_context {
     ws_context(const ws_model& model, const gpt_vocab& vocab)
         : model(model)
         , vocab(vocab)
+        , kv_cache(model.hparams)
     {
     }
 };
@@ -388,10 +417,10 @@ bool ws_eval(ws_context& wctx, const std::vector<gpt_vocab::id>& token_ids)
 
             // memory storage
             // store key and value to memory
-            struct ggml_tensor* k_mem = ggml_view_1d(inf_ctx, model.memory_k, num_tokens * d_model,
-                (ggml_element_size(model.memory_k) * d_model) * (i));
-            struct ggml_tensor* v_mem = ggml_view_1d(inf_ctx, model.memory_v, num_tokens * d_model,
-                (ggml_element_size(model.memory_v) * d_model) * (i));
+            struct ggml_tensor* k_mem = ggml_view_1d(inf_ctx, wctx.kv_cache.k, num_tokens * d_model,
+                (ggml_element_size(wctx.kv_cache.k) * d_model) * (i));
+            struct ggml_tensor* v_mem = ggml_view_1d(inf_ctx, wctx.kv_cache.v, num_tokens * d_model,
+                (ggml_element_size(wctx.kv_cache.v) * d_model) * (i));
 
             ggml_build_forward_expand(&gf, ggml_cpy(inf_ctx, k, k_mem));
             ggml_build_forward_expand(&gf, ggml_cpy(inf_ctx, v, v_mem));
@@ -417,8 +446,8 @@ bool ws_eval(ws_context& wctx, const std::vector<gpt_vocab::id>& token_ids)
 
             struct ggml_tensor* k_contiguous = ggml_permute(inf_ctx,
                 ggml_reshape_3d(inf_ctx,
-                    ggml_view_1d(inf_ctx, model.memory_k, (num_tokens)*d_model,
-                        i * ggml_element_size(model.memory_k) * d_model),
+                    ggml_view_1d(inf_ctx, wctx.kv_cache.k, (num_tokens)*d_model,
+                        i * ggml_element_size(wctx.kv_cache.k) * d_model),
                     d_head, n_heads, num_tokens),
                 0, 2, 1, 3);
 
@@ -453,7 +482,7 @@ bool ws_eval(ws_context& wctx, const std::vector<gpt_vocab::id>& token_ids)
             struct ggml_tensor* v_contiguous = ggml_cpy(
                 inf_ctx,
                 ggml_permute(inf_ctx,
-                    ggml_reshape_3d(inf_ctx, ggml_view_1d(inf_ctx, model.memory_v, (num_tokens)*d_model, i * ggml_element_size(model.memory_v) * d_model),
+                    ggml_reshape_3d(inf_ctx, ggml_view_1d(inf_ctx, wctx.kv_cache.v, (num_tokens)*d_model, i * ggml_element_size(wctx.kv_cache.v) * d_model),
                         d_head, n_heads, num_tokens),
                     1, 2, 0, 3),
                 ggml_new_tensor_3d(inf_ctx, GGML_TYPE_F32, num_tokens, d_head, n_heads));
